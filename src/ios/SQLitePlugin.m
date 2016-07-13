@@ -23,7 +23,10 @@
 #   define DLog(...)
 #endif
 
-@implementation SQLitePlugin
+@implementation SQLitePlugin {
+    NSString *previousSQLstatement;
+    sqlite3_stmt *preparedStmt;
+}
 
 @synthesize openDBs;
 @synthesize appDBPaths;
@@ -35,9 +38,11 @@
     {
         openDBs = [NSMutableDictionary dictionaryWithCapacity:0];
         appDBPaths = [NSMutableDictionary dictionaryWithCapacity:0];
+        previousSQLstatement = @"";
 #if !__has_feature(objc_arc)
         [openDBs retain];
         [appDBPaths retain];
+        [previousSQLstatement retain];
 #endif
 
         NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) objectAtIndex: 0];
@@ -138,7 +143,6 @@
 
             if (sqlite3_open(name, &db) != SQLITE_OK) {
                 pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Unable to open DB"];
-                return;
             } else {
                 // for SQLCipher version:
                 // NSString *dbkey = [options objectForKey:@"key"];
@@ -195,14 +199,21 @@
 
         if (db == NULL) {
             // Should not happen:
-            DLog(@"close: db name was not open: %@", dbFileName);
+            DLog(@"Close: db name was not open: %@", dbFileName);
             pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Specified db was not open"];
         }
         else {
-            DLog(@"close db name: %@", dbFileName);
-            sqlite3_close (db);
-            [openDBs removeObjectForKey:dbFileName];
-            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"DB closed"];
+            sqlite3_finalize(preparedStmt);
+ 
+            if (sqlite3_close(db) == SQLITE_OK) {
+                DLog(@"Close db name: %@", dbFileName);
+                [openDBs removeObjectForKey:dbFileName];
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"DB closed"];
+            }
+            else {
+                DLog(@"Unable to close db name: %@", dbFileName);
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Unable to close db"];
+            }
         }
     }
 
@@ -328,55 +339,72 @@
         return [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"You must specify a sql query to execute"];
     }
 
-    const char *sql_stmt = [sql UTF8String];
+    const char *sql_stmt;
     NSDictionary *error = nil;
-    sqlite3_stmt *statement;
     int result, i, column_type, count;
     int previousRowsAffected, nowRowsAffected, diffRowsAffected;
     long long previousInsertId, nowInsertId;
-    BOOL keepGoing = YES;
-    BOOL hasInsertId;
+    BOOL keepGoing   = YES
+    ,    hasInsertId = NO;
     NSMutableDictionary *resultSet = [NSMutableDictionary dictionaryWithCapacity:0];
     NSMutableArray *resultRows = [NSMutableArray arrayWithCapacity:0];
     NSMutableDictionary *entry;
-    NSObject *columnValue;
     NSString *columnName;
-    NSObject *insertId;
-    NSObject *rowsAffected;
+    NSObject *columnValue
+    ,        *insertId
+    ,        *rowsAffected;
 
-    hasInsertId = NO;
     previousRowsAffected = sqlite3_total_changes(db);
     previousInsertId = sqlite3_last_insert_rowid(db);
 
-    if (sqlite3_prepare_v2(db, sql_stmt, -1, &statement, NULL) != SQLITE_OK) {
-        error = [SQLitePlugin captureSQLiteErrorFromDb:db];
-        keepGoing = NO;
-    } else if (params != NULL) {
+    // no new prepare needed if statement is the same
+    if ([sql caseInsensitiveCompare:previousSQLstatement] != NSOrderedSame) {
+        sqlite3_finalize(preparedStmt);
+        sql_stmt = [sql UTF8String];
+        if (sqlite3_prepare_v2(db, sql_stmt, -1, &preparedStmt, NULL) != SQLITE_OK) {
+            previousSQLstatement = @"";
+            keepGoing = NO;
+        } else {
+            previousSQLstatement = sql;
+        }
+    }
+    else {
+        sqlite3_reset(preparedStmt);
+    }
+
+    if (keepGoing && params != NULL) {
         for (int b = 0; b < params.count; b++) {
-            [self bindStatement:statement withArg:[params objectAtIndex:b] atIndex:(b+1)];
+            if ([self bindStatement:preparedStmt withArg:[params objectAtIndex:b] atIndex:(b+1)] != SQLITE_OK) {
+                keepGoing = NO;
+                break;
+            }
         }
     }
 
+    if (!keepGoing) {
+        error = [SQLitePlugin captureSQLiteErrorFromDb:db];
+    }
+    
     while (keepGoing) {
-        result = sqlite3_step (statement);
+        result = sqlite3_step(preparedStmt);
         switch (result) {
 
             case SQLITE_ROW:
                 i = 0;
                 entry = [NSMutableDictionary dictionaryWithCapacity:0];
-                count = sqlite3_column_count(statement);
+                count = sqlite3_column_count(preparedStmt);
 
                 while (i < count) {
                     columnValue = nil;
-                    columnName = [NSString stringWithFormat:@"%s", sqlite3_column_name(statement, i)];
+                    columnName = [NSString stringWithFormat:@"%s", sqlite3_column_name(preparedStmt, i)];
 
-                    column_type = sqlite3_column_type(statement, i);
+                    column_type = sqlite3_column_type(preparedStmt, i);
                     switch (column_type) {
                         case SQLITE_INTEGER:
-                            columnValue = [NSNumber numberWithLongLong: sqlite3_column_int64(statement, i)];
+                            columnValue = [NSNumber numberWithLongLong: sqlite3_column_int64(preparedStmt, i)];
                             break;
                         case SQLITE_FLOAT:
-                            columnValue = [NSNumber numberWithDouble: sqlite3_column_double(statement, i)];
+                            columnValue = [NSNumber numberWithDouble: sqlite3_column_double(preparedStmt, i)];
                             break;
                         case SQLITE_BLOB:
 #ifdef READ_BLOB_AS_BASE64
@@ -388,8 +416,8 @@
                             break;
 #endif // else
                         case SQLITE_TEXT:
-                            columnValue = [[NSString alloc] initWithBytes:(char *)sqlite3_column_text(statement, i)
-                                                                   length:sqlite3_column_bytes(statement, i)
+                            columnValue = [[NSString alloc] initWithBytes:(char *)sqlite3_column_text(preparedStmt, i)
+                                                                   length:sqlite3_column_bytes(preparedStmt, i)
                                                                  encoding:NSUTF8StringEncoding];
 #if !__has_feature(objc_arc)
                             [columnValue autorelease];
@@ -416,9 +444,9 @@
                 diffRowsAffected = nowRowsAffected - previousRowsAffected;
                 rowsAffected = [NSNumber numberWithInt:diffRowsAffected];
                 nowInsertId = sqlite3_last_insert_rowid(db);
-                if (nowRowsAffected > 0 && nowInsertId != 0) {
+                if (nowRowsAffected > 0 && nowInsertId != 0 && nowInsertId != previousInsertId) {
                     hasInsertId = YES;
-                    insertId = [NSNumber numberWithLongLong:sqlite3_last_insert_rowid(db)];
+                    insertId = [NSNumber numberWithLongLong:nowInsertId];
                 }
                 keepGoing = NO;
                 break;
@@ -428,8 +456,6 @@
                 keepGoing = NO;
         }
     }
-
-    sqlite3_finalize (statement);
 
     if (error) {
         return [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsDictionary:error];
@@ -443,20 +469,22 @@
     return [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:resultSet];
 }
 
--(void)bindStatement:(sqlite3_stmt *)statement withArg:(NSObject *)arg atIndex:(int)argIndex
+-(int)bindStatement:(sqlite3_stmt *)statement withArg:(NSObject *)arg atIndex:(int)argIndex
 {
+    int retVal;
+    
     if ([arg isEqual:[NSNull null]]) {
-        sqlite3_bind_null(statement, argIndex);
+        retVal = sqlite3_bind_null(statement, argIndex);
     } else if ([arg isKindOfClass:[NSNumber class]]) {
         NSNumber *numberArg = (NSNumber *)arg;
         const char *numberType = [numberArg objCType];
         if (strcmp(numberType, @encode(int)) == 0 ||
             strcmp(numberType, @encode(long long int)) == 0) {
-            sqlite3_bind_int64(statement, argIndex, [numberArg longLongValue]);
+            retVal = sqlite3_bind_int64(statement, argIndex, [numberArg longLongValue]);
         } else if (strcmp(numberType, @encode(double)) == 0) {
-            sqlite3_bind_double(statement, argIndex, [numberArg doubleValue]);
+            retVal = sqlite3_bind_double(statement, argIndex, [numberArg doubleValue]);
         } else {
-            sqlite3_bind_text(statement, argIndex, [[arg description] UTF8String], -1, SQLITE_TRANSIENT);
+            retVal = sqlite3_bind_text(statement, argIndex, [[arg description] UTF8String], -1, SQLITE_TRANSIENT);
         }
     } else { // NSString
         NSString *stringArg;
@@ -480,15 +508,16 @@
             // convert to data URI, decode, store as blob
             stringArg = [stringArg stringByReplacingCharactersInRange:NSMakeRange(0,7) withString:@"data"];
             NSData *data = [NSData dataWithContentsOfURL: [NSURL URLWithString:stringArg]];
-            sqlite3_bind_blob(statement, argIndex, data.bytes, data.length, SQLITE_TRANSIENT);
+            retVal = sqlite3_bind_blob(statement, argIndex, data.bytes, data.length, SQLITE_TRANSIENT);
         }
         else
 #endif
         {
             NSData *data = [stringArg dataUsingEncoding:NSUTF8StringEncoding];
-            sqlite3_bind_text(statement, argIndex, data.bytes, (int)data.length, SQLITE_TRANSIENT);
+            retVal = sqlite3_bind_text(statement, argIndex, data.bytes, (int)data.length, SQLITE_TRANSIENT);
         }
     }
+    return retVal;
 }
 
 -(void)dealloc
@@ -498,18 +527,21 @@
     NSValue *pointer;
     NSString *key;
     sqlite3 *db;
+    
+    sqlite3_finalize(preparedStmt);
 
     /* close db the user forgot */
     for (i=0; i<[keys count]; i++) {
         key = [keys objectAtIndex:i];
         pointer = [openDBs objectForKey:key];
         db = [pointer pointerValue];
-        sqlite3_close (db);
+        sqlite3_close(db);
     }
 
 #if !__has_feature(objc_arc)
     [openDBs release];
     [appDBPaths release];
+    [previousSQLstatement release];
     [super dealloc];
 #endif
 }
@@ -523,7 +555,13 @@
 #endif
     const char *message = sqlite3_errmsg(db);
 
-    NSMutableDictionary *error = [NSMutableDictionary dictionaryWithCapacity:4];
+    NSMutableDictionary *error = [NSMutableDictionary dictionaryWithCapacity:
+#if INCLUDE_SQLITE_ERROR_INFO
+                                  5
+#else
+                                  2
+#endif
+                                  ];
 
     [error setObject:[NSNumber numberWithInt:webSQLCode] forKey:@"code"];
     [error setObject:[NSString stringWithUTF8String:message] forKey:@"message"];
