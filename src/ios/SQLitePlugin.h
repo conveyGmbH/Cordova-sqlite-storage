@@ -23,7 +23,9 @@ enum WebSQLError {
 };
 typedef int WebSQLError;
 
-@interface SQLitePlugin : CDVPlugin
+@interface SQLitePlugin : CDVPlugin {
+    NSMutableDictionary *openDBs;
+}
 
 @property (nonatomic, copy) NSMutableDictionary *openDBs;
 @property (nonatomic, copy) NSMutableDictionary *appDBPaths;
