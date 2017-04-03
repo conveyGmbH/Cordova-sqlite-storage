@@ -1,6 +1,9 @@
 .DS_Store
 .metadata/*
 *.swp
+*.cache
+*.suo
+*.db
 *~
 node_modules
 spec/myplugin
